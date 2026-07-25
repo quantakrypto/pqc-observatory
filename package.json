@@ -1,0 +1,22 @@
+{
+  "name": "pqc-observatory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A daily measurement of post-quantum readiness across a public panel of hosts: which negotiate hybrid TLS key exchange (X25519MLKEM768), tracked over time.",
+  "license": "Apache-2.0",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "observatory": "node --import tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
