@@ -5,7 +5,7 @@
 #   2. never probed (skipped within the same run it is added to).
 #
 # This is how an operator removes a host from active probing within one cycle,
-# per docs/adr/0007-observatory-probing-policy.md, without editing hosts.txt.
+# per docs/probing-policy.md, without editing panel.json.
 # `#` comments and blank lines are ignored.
 #
 # Example:
