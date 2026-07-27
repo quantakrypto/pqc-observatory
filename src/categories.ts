@@ -71,6 +71,13 @@ export const CATEGORIES: Record<string, Category> = {
     reason: "Large media properties, run by many independent operators, give a broad-web baseline.",
     relevance: "Baseline",
   },
+  government: {
+    id: "government",
+    label: "Government / public sector",
+    reason:
+      "Governments write the migration mandates the rest of the ecosystem follows (CNSA 2.0, NIS2, and national PQC deadlines), yet the public sector typically moves slower than the tech industry. Whether their own public front doors have migrated is therefore a distinct and telling signal, separate from the vendors they regulate.",
+    relevance: "Mandate-setter / baseline",
+  },
 };
 
 export function resolveCategory(id: string): Category {
