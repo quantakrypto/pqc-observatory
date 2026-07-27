@@ -49,7 +49,14 @@ category. The categories carry a short reason the host is on the panel and a not
 on how strong a signal it is for web-wide readiness (see
 [`src/categories.ts`](src/categories.ts)): CDNs are bellwethers because they carry
 so much of the web, security and PKI vendors are expected to lead, privacy
-messaging tends to move first, consumer sites are a baseline, and so on.
+messaging tends to move first, consumer sites are a baseline, governments are the
+mandate-setters measured against their own public front doors, and so on.
+
+The panel spans the technology categories above plus a **government** panel of
+200+ official national government and public-sector portals (roughly one per UN
+member state, plus a few notable territories), so the observatory tracks whether
+the institutions that write the migration mandates have migrated their own front
+doors.
 
 ### Contributing a host
 
