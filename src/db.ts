@@ -104,6 +104,13 @@ export type RollupResult = {
   byCategory: Record<string, { reachable: number; hybrid: number }>;
 };
 
+// Categories tracked as their own separate panels, kept OUT of the headline
+// pct_hybrid_kex. The top-line number is the "web" leading-indicator panel (CDNs,
+// clouds, security vendors, etc.); the government panel is a different and slower
+// population and must not move it. Each excluded category is still fully recorded
+// in by_category so it can be reported on its own.
+const HEADLINE_EXCLUDE = new Set<string>(["government"]);
+
 export async function computeRollup(client: pg.Client, runDate: string): Promise<RollupResult> {
   const { rows } = await client.query(
     `SELECT h.category, p.reachable, p.kex_hybrid
@@ -118,11 +125,13 @@ export async function computeRollup(client: pg.Client, runDate: string): Promise
     const cat = r.category ?? "other";
     byCategory[cat] ??= { reachable: 0, hybrid: 0 };
     if (r.reachable) {
-      reachable += 1;
       byCategory[cat].reachable += 1;
-      if (r.kex_hybrid) {
-        hybrid += 1;
-        byCategory[cat].hybrid += 1;
+      if (r.kex_hybrid) byCategory[cat].hybrid += 1;
+      // The headline totals cover the web panel only; separate panels (government)
+      // live in by_category and never move the top-line adoption figure.
+      if (!HEADLINE_EXCLUDE.has(cat)) {
+        reachable += 1;
+        if (r.kex_hybrid) hybrid += 1;
       }
     }
   }
