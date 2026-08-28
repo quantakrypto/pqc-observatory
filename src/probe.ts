@@ -32,12 +32,8 @@ export type Measurement = {
   /** Address both connections used. Null when resolution failed. */
   address: string | null;
   /**
-   * Whether the first connection was issued a session ticket, or null when that could not
-   * be observed because no application data was sent. Some servers, Cloudflare's among them,
-   * send NewSessionTicket only after receiving a request: measured directly, ietf.org yields
-   * no ticket banner after five seconds of silence and four after a single HEAD. Reporting
-   * that silence as "issued no ticket" would be false for a large share of the web, so it is
-   * reported as null instead.
+   * Whether a session ticket was issued at all. Null only when no request was sent and none
+   * arrived unprompted, in which case the server was never really asked.
    */
   ticketIssued: boolean | null;
   /** Server's lifetime hint in seconds, when it printed one. */
@@ -98,6 +94,68 @@ function runOpenssl(args: string[], timeoutMs: number, stdin: string, holdMs = 0
   });
 }
 
+/**
+ * One s_client connection that answers two questions instead of one.
+ *
+ * It completes the handshake, waits `silentMs`, sends `request`, then holds the connection open
+ * `holdMs` longer so a post-handshake NewSessionTicket has time to arrive.
+ *
+ * An earlier version also snapshotted the transcript just before writing the request, to record
+ * whether the server had volunteered a ticket unprompted. That does not work: s_client surfaces
+ * the ticket banner only as the connection closes, so the snapshot reads empty for every host.
+ * Measured: 3,780 bytes of transcript had arrived after 2.5s of silence with no banner, and the
+ * banner appeared at close. Recording that unprompted behaviour needs a third connection, which
+ * is not worth 50% more load on a daily panel; it is measured by hand instead in
+ * quantakrypto/tls-resumption-tests.
+ */
+function runSClient(
+  args: string[],
+  timeoutMs: number,
+  request: string,
+  silentMs: number,
+  holdMs: number,
+): Promise<string> {
+  return new Promise((resolve) => {
+    const p = spawn("openssl", args, { stdio: ["pipe", "pipe", "pipe"] });
+    let out = "";
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(out);
+    };
+    const timer = setTimeout(() => {
+      try {
+        p.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }, timeoutMs);
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (out += d.toString()));
+    p.on("error", done);
+    p.on("close", done);
+
+    const send = setTimeout(() => {
+      try {
+        if (request) p.stdin.write(request);
+      } catch {
+        /* ignore */
+      }
+      const end = setTimeout(() => {
+        try {
+          p.stdin.end();
+        } catch {
+          /* already closed */
+        }
+      }, holdMs);
+      end.unref?.();
+    }, silentMs);
+    send.unref?.();
+  });
+}
+
 function firstPem(s: string): string | null {
   const m = s.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/);
   return m ? m[0] : null;
@@ -129,7 +187,7 @@ export async function measureHost(
     certSigAlg: null,
     certNotAfter: null,
     address: null,
-    ticketIssued: false,
+    ticketIssued: null,
     ticketLifetimeS: null,
     resumed: null,
     error: null,
@@ -167,15 +225,18 @@ async function measurePinned(
   // HOLD_MS keeps the connection open after the handshake so a TLS 1.3
   // NewSessionTicket, which arrives post-handshake, has time to be written out.
   // Sending nothing and exiting immediately would miss every TLS 1.3 ticket.
+  const SILENT_MS = 1500;
   const HOLD_MS = 1500;
-  // A HEAD for the root, nothing else, and only to make the ticket observable. It reads no
-  // body and changes no state, and it is exactly what a browser sends on every visit.
+  // A HEAD for the root, nothing else. It reads no body and changes no state, and it is what
+  // a browser sends on every visit. It exists only to make ticket issuance observable on the
+  // servers that withhold NewSessionTicket until a request arrives.
   const request = sendRequest ? `HEAD / HTTP/1.1\r\nHost: ${domain}\r\nConnection: close\r\n\r\n` : "";
-  const out = await runOpenssl(
+  const out = await runSClient(
     ["s_client", "-connect", `${address}:443`, "-servername", domain, "-verify_hostname", domain,
      "-groups", GROUPS, "-sess_out", sessionFile],
     timeoutMs,
     request,
+    SILENT_MS,
     HOLD_MS,
   );
 
@@ -204,9 +265,9 @@ async function measurePinned(
   // A ticket shows up either as the TLS 1.3 post-handshake banner or, on 1.2, as a
   // session block carrying ticket material.
   const lifeM = out.match(/TLS session ticket lifetime hint:\s*(\d+)/i);
-  const sawTicket =
-    /Post-Handshake New Session Ticket arrived/i.test(out) || /TLS session ticket:/i.test(out);
-  // Without a request, an absent ticket is unobservable rather than absent.
+  const TICKET = /Post-Handshake New Session Ticket arrived|TLS session ticket:/i;
+  const sawTicket = TICKET.test(out);
+  // With a request sent, absence is a real absence. Without one, it is merely unobserved.
   const ticketIssued: boolean | null = sawTicket ? true : sendRequest ? false : null;
 
   let resumed: boolean | null = null;
