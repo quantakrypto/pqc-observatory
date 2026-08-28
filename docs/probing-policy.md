@@ -9,12 +9,25 @@ the worker enforces it in code.
 
 For each host on the panel, once per day:
 
-- Exactly **one** TLS handshake to port 443, driven by `openssl s_client`.
-- We offer the hybrid group X25519MLKEM768 alongside the usual classical groups and
-  record which the server selects, plus the negotiated TLS version and the leaf
-  certificate's signature algorithm and expiry.
-- We read the handshake only. **No application data is ever sent.** We do not send
-  HTTP, we do not authenticate, we do not attempt anything beyond the handshake.
+- **Two or three** TLS handshakes to port 443, driven by `openssl s_client`.
+- The first is silent. We offer the hybrid group X25519MLKEM768 alongside the usual
+  classical groups and record which the server selects, plus the negotiated TLS version
+  and the leaf certificate's signature algorithm and expiry. We write nothing on it, so a
+  session ticket arriving here is one the server volunteered.
+- If the server volunteered no ticket, a second connection sends **one `HEAD /` and
+  nothing else**, because many servers withhold NewSessionTicket until a request arrives.
+  Measured on 28 August 2026, over a fourteen-host panel probed twice: silent connections
+  drew a ticket from 8 hosts, a single HEAD drew one from all 14. Without the request,
+  six hosts including `ietf.org`, `google.com` and `www.cloudflare.com` would be recorded
+  as issuing no ticket, which is false.
+- The last connection offers that ticket back, to the **same address and the same SNI**,
+  and records whether the server resumed. A ticket is never offered to a host that did not
+  issue it: that would be probing someone else's access control with credentials minted by
+  another configuration, and we have no standing to do it.
+- We authenticate nothing and we send no credential. `HEAD /` reads no body and changes no
+  state. `--no-request` restores strict handshake-only behaviour, in which ticket issuance
+  is recorded as `null` rather than as false, because a server that was never asked cannot
+  be said to have declined.
 
 ## Restraint (enforced in `src/run.ts` and `src/probe.ts`)
 
@@ -30,7 +43,8 @@ For each host on the panel, once per day:
 To have a host removed from the panel, open a pull request adding it to
 `optout.txt`, or contact quantakrypto. Either is honored within one measurement
 cycle. We publish only aggregate trends and per-host readiness state, never traffic
-or content (there is none to publish; we never send a request).
+or content. The only request we send is `HEAD /`, whose response body we do not read,
+store or publish; what we keep from it is whether a session ticket was issued.
 
 ## Why a separate worker
 
