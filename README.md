@@ -9,14 +9,21 @@ Maintained by [quantakrypto](https://quantakrypto.com). Apache-2.0.
 
 ## What it measures
 
-For each host in [`panel.json`](panel.json), once a day, over a single read-only
-TLS handshake to port 443:
+For each host in [`panel.json`](panel.json), once a day, over two read-only TLS
+handshakes to port 443:
 
 - **Hybrid key exchange** - whether the server selects **X25519MLKEM768**, the
   hybrid that stays secure if either the classical or the post-quantum half holds.
   This is the clearest single signal that a host has begun its migration.
 - **Certificate posture** - the negotiated TLS version and the leaf certificate's
   signature algorithm and expiry.
+- **Resumption** - whether the server issued a session ticket, the lifetime hint it
+  carried, and whether a second connection offering that ticket back was resumed. Both
+  connections use the same pinned address and the same SNI: without pinning, a failure to
+  resume could be a different edge node rather than a refusal, and the two are not
+  distinguishable afterwards. A ticket is never offered to a host that did not issue it.
+  A host that issued no ticket records `resumed = null`, not false, because it was never
+  asked, and a coverage gap must never be counted as a refusal.
 - **Reachability** - whether a handshake completed at all, so a coverage gap never
   reads as a drop in adoption.
 
@@ -31,11 +38,18 @@ A measurement you cannot trust is worse than none, so the method is deliberately
 dull and is enforced in code, not just documented (see
 [docs/probing-policy.md](docs/probing-policy.md)):
 
-- one TLS handshake per host per run, driven by `openssl s_client`;
+- two TLS handshakes per host per run, driven by `openssl s_client`: one to measure the
+  handshake, one to offer back any session ticket it was issued;
 - sequential, with a minimum gap between hosts (no parallel fan-out);
 - a hard per-connection timeout and no aggressive retries (a refusal or timeout is
   recorded as unreachable);
-- no application data is ever sent, and nothing beyond the handshake is attempted;
+- one `HEAD /` per connection and nothing else. This changed when resumption was added:
+  some servers, Cloudflare's among them, send NewSessionTicket only after a request
+  arrives, so measuring ticket issuance without one reports "no ticket" for a large
+  share of the web. Measured directly: `ietf.org` emits no ticket banner after five
+  seconds of silence, and four after a single HEAD. The request reads no body and
+  changes no state, and `--no-request` restores the handshake-only behaviour, in which
+  ticket issuance records as `null` rather than as false;
 - a host in [`optout.txt`](optout.txt) (or marked opted-out in the database) is
   skipped before any connection.
 

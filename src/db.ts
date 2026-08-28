@@ -33,6 +33,13 @@ export async function ensureSchema(client: pg.Client): Promise<void> {
       kex_hybrid boolean NOT NULL DEFAULT false, kex_group text, tls_version text,
       cert_sig_alg text, cert_expiry timestamptz, probed_at timestamptz NOT NULL DEFAULT now(),
       raw jsonb NOT NULL DEFAULT '{}'::jsonb, UNIQUE (host_id, run_date));
+    -- Resumption. Both ticket_issued and resumed are deliberately NULLABLE with no default: a host that issued
+    -- no ticket was never asked, and recording that as false would count a coverage gap as
+    -- a refusal. Read it as: true resumed, false refused, null not askable.
+    ALTER TABLE observatory_probe ADD COLUMN IF NOT EXISTS address text;
+    ALTER TABLE observatory_probe ADD COLUMN IF NOT EXISTS ticket_issued boolean;
+    ALTER TABLE observatory_probe ADD COLUMN IF NOT EXISTS ticket_lifetime_s int;
+    ALTER TABLE observatory_probe ADD COLUMN IF NOT EXISTS resumed boolean;
     CREATE INDEX IF NOT EXISTS observatory_probe_date_idx ON observatory_probe (run_date);
 
     CREATE TABLE IF NOT EXISTS observatory_rollup (
@@ -74,12 +81,15 @@ export async function upsertProbe(client: pg.Client, hostId: string, runDate: st
   const id = `obp-${randomBytes(8).toString("hex")}`;
   await client.query(
     `INSERT INTO observatory_probe
-       (id, host_id, run_date, reachable, kex_hybrid, kex_group, tls_version, cert_sig_alg, cert_expiry, raw)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb)
+       (id, host_id, run_date, reachable, kex_hybrid, kex_group, tls_version, cert_sig_alg, cert_expiry, raw,
+        address, ticket_issued, ticket_lifetime_s, resumed)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14)
      ON CONFLICT (host_id, run_date) DO UPDATE SET
        reachable = EXCLUDED.reachable, kex_hybrid = EXCLUDED.kex_hybrid, kex_group = EXCLUDED.kex_group,
        tls_version = EXCLUDED.tls_version, cert_sig_alg = EXCLUDED.cert_sig_alg,
-       cert_expiry = EXCLUDED.cert_expiry, probed_at = now(), raw = EXCLUDED.raw`,
+       cert_expiry = EXCLUDED.cert_expiry, probed_at = now(), raw = EXCLUDED.raw,
+       address = EXCLUDED.address, ticket_issued = EXCLUDED.ticket_issued,
+       ticket_lifetime_s = EXCLUDED.ticket_lifetime_s, resumed = EXCLUDED.resumed`,
     [
       id,
       hostId,
@@ -91,6 +101,10 @@ export async function upsertProbe(client: pg.Client, hostId: string, runDate: st
       m.certSigAlg,
       m.certNotAfter,
       JSON.stringify({ cipher: m.cipher, error: m.error }),
+      m.address,
+      m.ticketIssued,
+      m.ticketLifetimeS,
+      m.resumed,
     ],
   );
 }
