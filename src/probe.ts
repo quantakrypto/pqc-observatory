@@ -169,6 +169,23 @@ function runSClient(
   });
 }
 
+/**
+ * Format a resolved address for `s_client -connect`.
+ *
+ * An IPv6 literal MUST be bracketed, because the host and the port are colon-separated and
+ * without brackets OpenSSL cannot tell where the address ends: it rejects the argument with
+ * "ambiguous host or service" and the probe records the host as unreachable.
+ *
+ * This is not hypothetical. Pinning the address (added with the resumption measurement) made the
+ * prober format its own connect string for the first time, and on the run of 2026-08-28 every
+ * host whose resolver answered with an AAAA record went dark at once: 99 addresses came back
+ * IPv6, 95 hosts flipped from reachable to unreachable in a single day, and the panel's reachable
+ * count fell from 249 to 160. Nothing about those hosts had changed.
+ */
+export function connectTarget(address: string, port: number): string {
+  return address.includes(":") ? `[${address}]:${port}` : `${address}:${port}`;
+}
+
 function firstPem(s: string): string | null {
   const m = s.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/);
   return m ? m[0] : null;
@@ -245,7 +262,7 @@ async function measurePinned(
   // a browser sends on every visit. It exists only to make ticket issuance observable on the
   // servers that withhold NewSessionTicket until a request arrives.
   const request = sendRequest ? `HEAD / HTTP/1.1\r\nHost: ${domain}\r\nConnection: close\r\n\r\n` : "";
-  const connect = ["s_client", "-connect", `${address}:443`, "-servername", domain,
+  const connect = ["s_client", "-connect", connectTarget(address, 443), "-servername", domain,
                    "-verify_hostname", domain, "-groups", GROUPS];
 
   // First connection, silent. Nothing is written on it, so a ticket arriving here is one the
@@ -311,8 +328,7 @@ async function measurePinned(
     // Same address, same SNI, ticket offered back. Never to a different host: replaying
     // across hosts is a scope experiment on somebody else's access control, not ours to run.
     const again = await runOpenssl(
-      ["s_client", "-connect", `${address}:443`, "-servername", domain, "-verify_hostname", domain,
-       "-groups", GROUPS, "-sess_in", sessionFile],
+      [...connect, "-sess_in", sessionFile],
       timeoutMs,
       request,
       0,
