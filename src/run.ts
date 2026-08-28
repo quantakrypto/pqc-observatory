@@ -21,6 +21,8 @@ export interface RunOptions {
   optoutFile?: string;
   timeoutMs?: number;
   minIntervalMs?: number;
+  /** False makes every connection silent, so no application data is sent. Default true. */
+  sendRequest?: boolean;
   dryRun?: boolean;
   databaseUrl?: string;
   log?: (line: string) => void;
@@ -38,6 +40,13 @@ export interface RunSummary {
 }
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Print a tri-state as yes/no/n-a. Null is never printed as "no": across every resumption
+ * field in this run, null means the question was not put to the server and false means it was
+ * put and answered in the negative, and a log that blurs the two invites the wrong reading.
+ */
+const tri = (v: boolean | null): string => (v === null ? "n/a" : v ? "yes" : "no");
 
 /** Validate/derive the run date as YYYY-MM-DD (UTC). */
 export function resolveDate(opts: Pick<RunOptions, "date" | "now">): string {
@@ -58,6 +67,7 @@ export async function run(opts: RunOptions = {}): Promise<RunSummary> {
   const runDate = resolveDate(opts);
   const timeoutMs = opts.timeoutMs ?? 8000;
   const minIntervalMs = opts.minIntervalMs ?? 500;
+  const sendRequest = opts.sendRequest ?? true;
   const dryRun = opts.dryRun ?? false;
 
   const panelFile = opts.panelFile ?? join(PKG_ROOT, "panel.json");
@@ -95,7 +105,7 @@ export async function run(opts: RunOptions = {}): Promise<RunSummary> {
       if (!first && minIntervalMs > 0) await delay(minIntervalMs);
       first = false;
 
-      const m = await measureHost(seed.domain, { timeoutMs });
+      const m = await measureHost(seed.domain, { timeoutMs, sendRequest });
       probed += 1;
       if (m.reachable) {
         reachable += 1;
@@ -103,7 +113,10 @@ export async function run(opts: RunOptions = {}): Promise<RunSummary> {
       }
       log(
         `  ${seed.domain}: ${
-          m.reachable ? `${m.tlsVersion ?? "?"} kex=${m.kexGroup ?? "?"} hybrid=${m.kexHybrid} sig=${m.certSigAlg ?? "?"}` : `unreachable (${m.error ?? "unknown"})`
+          m.reachable
+            ? `${m.tlsVersion ?? "?"} kex=${m.kexGroup ?? "?"} hybrid=${m.kexHybrid} sig=${m.certSigAlg ?? "?"} ` +
+              `ticket=${tri(m.ticketIssued)} volunteered=${tri(m.ticketWithoutRequest)} resumed=${tri(m.resumed)}`
+            : `unreachable (${m.error ?? "unknown"})`
         }`,
       );
       if (client) await upsertProbe(client, row?.id ?? seed.domain, runDate, m);
@@ -114,6 +127,13 @@ export async function run(opts: RunOptions = {}): Promise<RunSummary> {
       const rollup = await computeRollup(client, runDate);
       pctHybridKex = rollup.pctHybridKex;
       log(`observatory: rollup ${rollup.runDate} reachable=${rollup.reachable} hybrid=${rollup.hybrid} pct=${rollup.pctHybridKex}%`);
+      const r = rollup.resumption;
+      // Each count with its own denominator. These are three different populations and a
+      // single ratio over "reachable" would merge them into a number that means nothing.
+      log(
+        `observatory: resumption ${rollup.runDate} ticket=${r.ticketIssued}/${r.ticketAsked} ` +
+          `volunteered=${r.ticketVolunteered}/${r.ticketVolunteerAsked} resumed=${r.resumed}/${r.resumptionOffered}`,
+      );
     }
 
     return {

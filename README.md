@@ -38,18 +38,23 @@ A measurement you cannot trust is worse than none, so the method is deliberately
 dull and is enforced in code, not just documented (see
 [docs/probing-policy.md](docs/probing-policy.md)):
 
-- two TLS handshakes per host per run, driven by `openssl s_client`: one to measure the
-  handshake, one to offer back any session ticket it was issued;
+- two or three TLS handshakes per host per run, driven by `openssl s_client`: a silent one
+  that measures the handshake and sees whether a ticket is volunteered, a second carrying
+  one `HEAD /` only if the first drew no ticket, and a last one offering that ticket back;
 - sequential, with a minimum gap between hosts (no parallel fan-out);
 - a hard per-connection timeout and no aggressive retries (a refusal or timeout is
   recorded as unreachable);
-- one `HEAD /` per connection and nothing else. This changed when resumption was added:
-  some servers, Cloudflare's among them, send NewSessionTicket only after a request
-  arrives, so measuring ticket issuance without one reports "no ticket" for a large
-  share of the web. Measured directly: `ietf.org` emits no ticket banner after five
-  seconds of silence, and four after a single HEAD. The request reads no body and
-  changes no state, and `--no-request` restores the handshake-only behaviour, in which
-  ticket issuance records as `null` rather than as false;
+- at most one `HEAD /` per connection and nothing else. This changed when resumption was
+  added: many servers send NewSessionTicket only after a request arrives, so measuring
+  ticket issuance without one reports "no ticket" for a large share of the web. Measured
+  on 28 August 2026, running a fourteen-host panel twice back to back, the second run
+  starting as the first finished: silent connections drew a ticket from **8 of 14** hosts,
+  one `HEAD /` drew one from **14 of 14**. The six that volunteer nothing are the Google- and Cloudflare-fronted names,
+  `ietf.org` among them. The request reads no body and changes no state, and
+  `--no-request` restores strict handshake-only behaviour, in which ticket issuance
+  records as `null` rather than as false;
+- the ticket is offered back only to the address and SNI that issued it, never across
+  hosts;
 - a host in [`optout.txt`](optout.txt) (or marked opted-out in the database) is
   skipped before any connection.
 
@@ -108,9 +113,18 @@ migration; this worker also creates them defensively):
 
 - `observatory_host` - the panel: domain, rank, category, reason, relevance, opt-out.
 - `observatory_probe` - one row per host per `run_date` (`ON CONFLICT (host_id, run_date)`),
-  with reachability, hybrid selection, group, TLS version, cert signature and expiry.
+  with reachability, hybrid selection, group, TLS version, cert signature and expiry, plus
+  the pinned address and four resumption columns: `ticket_issued`, `ticket_lifetime_s`,
+  `ticket_without_request` and `resumed`. Three of those are nullable with no default, and
+  the null means one specific thing: the question was not put to that server. A host that
+  was never asked for a ticket has `ticket_issued = null`, not false; a host that issued no
+  ticket has `resumed = null`, not false. Only `false` is a negative answer.
 - `observatory_rollup` - one row per `run_date` with the reachable count, the hybrid
-  percentage, and a per-category breakdown.
+  percentage, a per-category breakdown, and the resumption counts as **counts beside their
+  own denominators** (`ticket_issued`/`ticket_asked`, `ticket_volunteered`/
+  `ticket_volunteer_asked`, `resumed`/`resumption_offered`) rather than as percentages.
+  The three are drawn from three different populations, so a single ratio over the
+  reachable count would merge them into a figure that means nothing.
 
 ## Deployment
 

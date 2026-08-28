@@ -5,12 +5,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /**
- * A single host measurement, produced by two read-only TLS handshakes driven by
- * `openssl s_client`. The first offers the hybrid group first alongside classical
- * fallbacks and records which the server actually selects, plus the certificate's
- * signature algorithm and expiry. The second offers back any session ticket the
- * first was issued, to the SAME address and the SAME SNI, and records whether the
- * server resumed. No application data is ever sent on either.
+ * A single host measurement, produced by two or three read-only TLS handshakes driven
+ * by `openssl s_client`. The first is silent: it offers the hybrid group first alongside
+ * classical fallbacks, records which the server actually selects along with the
+ * certificate's signature algorithm and expiry, and writes nothing at all, so a ticket
+ * arriving on it is one the server volunteered. Servers that volunteer nothing get a
+ * second connection carrying one HEAD request, because roughly half of the panel withholds
+ * NewSessionTicket until a request arrives and would otherwise look ticketless. The last
+ * connection offers back whatever ticket was issued, to the SAME address and the SAME SNI,
+ * and records whether the server resumed.
  *
  * Why the address is pinned: if the two connections landed on different edge nodes,
  * a failure to resume would be a statement about ticket-key distribution rather than
@@ -38,6 +41,13 @@ export type Measurement = {
   ticketIssued: boolean | null;
   /** Server's lifetime hint in seconds, when it printed one. */
   ticketLifetimeS: number | null;
+  /**
+   * Whether the server volunteered a ticket on a connection that sent no application data.
+   * False means none arrived while the silent connection was held open, which is a bounded
+   * claim: the bound is SILENT_MS + HOLD_MS below, not infinity. Null when the silent
+   * connection never completed a handshake.
+   */
+  ticketWithoutRequest: boolean | null;
   /** True resumed, false refused, null not askable because no ticket was issued. */
   resumed: boolean | null;
   error: string | null;
@@ -100,13 +110,16 @@ function runOpenssl(args: string[], timeoutMs: number, stdin: string, holdMs = 0
  * It completes the handshake, waits `silentMs`, sends `request`, then holds the connection open
  * `holdMs` longer so a post-handshake NewSessionTicket has time to arrive.
  *
- * An earlier version also snapshotted the transcript just before writing the request, to record
- * whether the server had volunteered a ticket unprompted. That does not work: s_client surfaces
- * the ticket banner only as the connection closes, so the snapshot reads empty for every host.
- * Measured: 3,780 bytes of transcript had arrived after 2.5s of silence with no banner, and the
- * banner appeared at close. Recording that unprompted behaviour needs a third connection, which
- * is not worth 50% more load on a daily panel; it is measured by hand instead in
- * quantakrypto/tls-resumption-tests.
+ * Passing an empty `request` makes this a silent connection: it handshakes, waits, and closes
+ * without ever writing application data. That is how `ticketWithoutRequest` is measured.
+ *
+ * It has to be a separate connection, and this is worth recording because the obvious cheaper
+ * design does not work. Snapshotting the transcript just before writing the request, to see
+ * whether a ticket had already arrived, reads empty for every host including the ones that
+ * demonstrably volunteer one: s_client surfaces the ticket banner only as the connection
+ * closes, by which point the request has long gone. Measured, against aws.amazon.com: 3,780
+ * bytes of transcript had arrived after 2.5s of silence with no banner, and the banner
+ * appeared at close. Not output buffering, just when s_client prints it.
  */
 function runSClient(
   args: string[],
@@ -189,6 +202,7 @@ export async function measureHost(
     address: null,
     ticketIssued: null,
     ticketLifetimeS: null,
+    ticketWithoutRequest: null,
     resumed: null,
     error: null,
   };
@@ -231,11 +245,15 @@ async function measurePinned(
   // a browser sends on every visit. It exists only to make ticket issuance observable on the
   // servers that withhold NewSessionTicket until a request arrives.
   const request = sendRequest ? `HEAD / HTTP/1.1\r\nHost: ${domain}\r\nConnection: close\r\n\r\n` : "";
+  const connect = ["s_client", "-connect", `${address}:443`, "-servername", domain,
+                   "-verify_hostname", domain, "-groups", GROUPS];
+
+  // First connection, silent. Nothing is written on it, so a ticket arriving here is one the
+  // server offered without being asked for anything.
   const out = await runSClient(
-    ["s_client", "-connect", `${address}:443`, "-servername", domain, "-verify_hostname", domain,
-     "-groups", GROUPS, "-sess_out", sessionFile],
+    [...connect, "-sess_out", sessionFile],
     timeoutMs,
-    request,
+    "",
     SILENT_MS,
     HOLD_MS,
   );
@@ -264,11 +282,29 @@ async function measurePinned(
 
   // A ticket shows up either as the TLS 1.3 post-handshake banner or, on 1.2, as a
   // session block carrying ticket material.
-  const lifeM = out.match(/TLS session ticket lifetime hint:\s*(\d+)/i);
   const TICKET = /Post-Handshake New Session Ticket arrived|TLS session ticket:/i;
-  const sawTicket = TICKET.test(out);
+  const LIFETIME = /TLS session ticket lifetime hint:\s*(\d+)/i;
+
+  const volunteered = TICKET.test(out);
+  let ticketTranscript = out;
+
+  // Only the servers that volunteered nothing are asked. On this panel that is roughly half
+  // of them, so the request costs a connection where it buys an answer and nowhere else.
+  if (!volunteered && sendRequest) {
+    const asked = await runSClient(
+      [...connect, "-sess_out", sessionFile],
+      timeoutMs,
+      request,
+      0,
+      HOLD_MS,
+    );
+    if (TICKET.test(asked)) ticketTranscript = asked;
+  }
+
+  const sawTicket = TICKET.test(ticketTranscript);
   // With a request sent, absence is a real absence. Without one, it is merely unobserved.
   const ticketIssued: boolean | null = sawTicket ? true : sendRequest ? false : null;
+  const lifeM = ticketTranscript.match(LIFETIME);
 
   let resumed: boolean | null = null;
   if (sawTicket) {
@@ -299,6 +335,7 @@ async function measurePinned(
     address,
     ticketIssued,
     ticketLifetimeS: lifeM ? Number(lifeM[1]) : null,
+    ticketWithoutRequest: volunteered,
     resumed,
     error: null,
   };

@@ -2,7 +2,7 @@
  * observatory - PQC readiness prober for the public panel.
  *
  *   observatory run [--date YYYY-MM-DD] [--panel PATH] [--optout PATH]
- *                   [--timeout MS] [--interval MS] [--dry-run]
+ *                   [--timeout MS] [--interval MS] [--no-request] [--dry-run]
  *
  * When --date is omitted it uses OBS_DATE, else today (UTC). --dry-run probes
  * without touching Postgres. DATABASE_URL is read from the environment.
@@ -20,6 +20,9 @@ Options:
   --optout PATH      Opt-out file (default: optout.txt)
   --timeout MS       Per-host handshake timeout (default: 8000)
   --interval MS      Minimum gap between hosts (default: 500)
+  --no-request       Send no application data at all. Restores handshake-only behaviour;
+                     hosts that withhold NewSessionTicket until a request arrives then
+                     record ticket_issued as null rather than false
   --dry-run          Probe without writing to Postgres
   -h, --help         Show this help
 
@@ -28,7 +31,7 @@ Environment:
   OBS_DATE           Fallback run date when --date is not given
 `;
 
-type Parsed = { date?: string; panel?: string; optout?: string; timeout?: number; interval?: number; dryRun?: boolean };
+type Parsed = { date?: string; panel?: string; optout?: string; timeout?: number; interval?: number; sendRequest?: boolean; dryRun?: boolean };
 
 function parseArgs(argv: string[]): { cmd: string; opts: Parsed } {
   const [cmd = "", ...rest] = argv;
@@ -41,6 +44,7 @@ function parseArgs(argv: string[]): { cmd: string; opts: Parsed } {
       case "--optout": opts.optout = rest[++i]; break;
       case "--timeout": opts.timeout = Number(rest[++i]); break;
       case "--interval": opts.interval = Number(rest[++i]); break;
+      case "--no-request": opts.sendRequest = false; break;
       case "--dry-run": opts.dryRun = true; break;
       default: break;
     }
@@ -66,6 +70,7 @@ async function main(): Promise<void> {
     optoutFile: opts.optout,
     timeoutMs: opts.timeout,
     minIntervalMs: opts.interval,
+    sendRequest: opts.sendRequest,
     dryRun: opts.dryRun,
   });
   process.stdout.write(JSON.stringify(summary, null, 2) + "\n");
