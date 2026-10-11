@@ -5,10 +5,13 @@
   "type": "module",
   "description": "A daily measurement of post-quantum readiness across a public panel of hosts: which negotiate hybrid TLS key exchange (X25519MLKEM768), tracked over time.",
   "license": "Apache-2.0",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "observatory": "node --import tsx src/cli.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "pg": "^8.13.1"
