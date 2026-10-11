@@ -342,7 +342,7 @@ async function measurePinned(
 
   return {
     reachable: true,
-    kexHybrid: /X25519MLKEM768/i.test(out),
+    kexHybrid: groupM?.[1]?.trim() === "X25519MLKEM768",
     kexGroup: groupM?.[1]?.trim() ?? null,
     tlsVersion: verM?.[1] ?? null,
     cipher: cipherM?.[1] ?? null,
