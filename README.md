@@ -9,14 +9,16 @@ Maintained by [quantakrypto](https://quantakrypto.com). Apache-2.0.
 
 ## What it measures
 
-For each host in [`panel.json`](panel.json), once a day, over two read-only TLS
+For each host in [`panel.json`](panel.json), once a day, over two or three read-only TLS
 handshakes to port 443:
 
 - **Hybrid key exchange** - whether the server selects **X25519MLKEM768**, the
   hybrid that stays secure if either the classical or the post-quantum half holds.
   This is the clearest single signal that a host has begun its migration.
-- **Certificate posture** - the negotiated TLS version and the leaf certificate's
-  signature algorithm and expiry.
+- **Certificate posture** - TLS 1.3 is mandatory; the chain and hostname must validate.
+  The handshake signature is recorded separately from the leaf certificate's
+  signature and expiry. Leaf details come from a locally saved session and remain
+  unknown if the endpoint never issues a ticket.
 - **Resumption** - whether the server issued a session ticket, the lifetime hint it
   carried, and whether a second connection offering that ticket back was resumed. Both
   connections use the same pinned address and the same SNI: without pinning, a failure to
@@ -58,8 +60,11 @@ dull and is enforced in code, not just documented (see
 - a host in [`optout.txt`](optout.txt) (or marked opted-out in the database) is
   skipped before any connection.
 
-This is the same class of unauthenticated measurement that public scanners such as
-SSL Labs and Censys have run for years.
+The probe authenticates the server certificate but sends no client credential.
+Private, reserved and transition-network addresses are rejected before connecting;
+all DNS answers must be public. Explicit private-address overrides exist only for
+operator-controlled test calls. Diagnostics are bounded separately from application
+output, and failures cannot become authenticated observations.
 
 ## The panel
 
@@ -130,3 +135,38 @@ migration; this worker also creates them defensively):
 
 The worker runs on the same VM as the site, on a daily `systemd` timer. It needs
 `DATABASE_URL` and `openssl` 3.5+ in its environment. No separate infrastructure.
+
+## Authenticated observation export
+
+Fresh probes store certificate validation, exact bounded OpenSSL diagnostic
+transcript and `openssl-tls13-v1` provenance in the existing `raw` JSON column.
+Historical rows remain unchanged and cannot be upgraded to authenticated evidence.
+`kex_hybrid` now counts only validated, completed TLS 1.3 negotiation, so changes
+from old rollups can reflect stronger collection rules rather than server changes.
+The denominator now excludes TLS 1.2 and certificate-invalid endpoints previously
+counted as reachable; historical and new percentages are not directly comparable.
+Before production rollout, the website chart must disclose the methodology change
+and its effective collection date. This is a deployment gate, not evidence of
+adoption. New `raw.observation.profile` distinguishes validated records; absent
+profiles remain legacy telemetry. No extra reachability probe is introduced.
+
+The same `observatory run` path optionally saves private unsigned collector records
+with `OBS_COLLECT_OUTPUT`, or signs directly if `OBS_SIGNED_OUTPUT` and the issuer
+configuration are provided. The existing GitHub KMS identity can instead sign
+records transferred over an authenticated administrative channel:
+
+```sh
+npm run observatory -- export --input-dir /operator/verified-transfer
+```
+
+Signing uses the deployed attestation-authority `issueObservation` API, RFC 9964
+ML-DSA-65 JWS, the existing KMS key and authority ledger. `OBS_SIGNING_SUBJECTS`
+is an independently configured subject allowlist; optional `OBS_SNAPSHOT_BINDINGS`
+contains explicit `sha256:<hex>` manifest digests. Records older than one hour,
+invalid diagnostics and unauthorized subjects are rejected. No signing credentials
+are copied to the collector. A signature authenticates the collector statement,
+not independent proof that its measurement is true.
+
+See [deployment.md](docs/deployment.md) for the artifact boundary and required
+configuration. Dry runs never write the database, evidence files or KMS ledger.
+The CI job requires real local hybrid TLS tests on a pinned OpenSSL build.

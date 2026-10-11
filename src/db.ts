@@ -74,7 +74,7 @@ export async function upsertHosts(client: pg.Client, seeds: SeedHost[], optout: 
        ON CONFLICT (domain) DO UPDATE SET
          rank = EXCLUDED.rank, category = EXCLUDED.category,
          reason = EXCLUDED.reason, relevance = EXCLUDED.relevance,
-         opted_out_at = EXCLUDED.opted_out_at`,
+         opted_out_at = COALESCE(observatory_host.opted_out_at, EXCLUDED.opted_out_at)`,
       [id, s.domain, s.rank, cat.id, cat.reason, cat.relevance, optout.has(s.domain) ? new Date() : null],
     );
   }
@@ -92,7 +92,7 @@ export async function fetchHostRows(client: pg.Client, domains: string[]): Promi
   return map;
 }
 
-export async function upsertProbe(client: pg.Client, hostId: string, runDate: string, m: Measurement): Promise<void> {
+export async function upsertProbe(client: pg.Client, hostId: string, runDate: string, m: Measurement, signedToken?: string): Promise<void> {
   const id = `obp-${randomBytes(8).toString("hex")}`;
   await client.query(
     `INSERT INTO observatory_probe
@@ -116,7 +116,9 @@ export async function upsertProbe(client: pg.Client, hostId: string, runDate: st
       m.tlsVersion,
       m.certSigAlg,
       m.certNotAfter,
-      JSON.stringify({ cipher: m.cipher, error: m.error }),
+      JSON.stringify({ cipher: m.cipher, error: m.error, certificateValidated: m.certificateValidated,
+        peerSignatureType: m.peerSignatureType, observation: m.observation, transcript: m.transcript,
+        ...(signedToken ? { signedObservation: signedToken } : {}) }),
       m.address,
       m.ticketIssued,
       m.ticketLifetimeS,

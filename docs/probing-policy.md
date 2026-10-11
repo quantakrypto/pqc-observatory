@@ -24,7 +24,7 @@ For each host on the panel, once per day:
   and records whether the server resumed. A ticket is never offered to a host that did not
   issue it: that would be probing someone else's access control with credentials minted by
   another configuration, and we have no standing to do it.
-- We authenticate nothing and we send no credential. `HEAD /` reads no body and changes no
+- We validate the server certificate chain and hostname and send no client credential. `HEAD /` reads no body and changes no
   state. `--no-request` restores strict handshake-only behaviour, in which ticket issuance
   is recorded as `null` rather than as false, because a server that was never asked cannot
   be said to have declined.
@@ -33,8 +33,9 @@ For each host on the panel, once per day:
 
 - **Sequential.** Hosts are probed one at a time, never fanned out in parallel.
 - **Spaced.** A minimum interval (default 500ms) separates successive hosts.
-- **Bounded.** A hard per-connection timeout (default 8s). A refusal or timeout is
+- **Bounded.** A hard per-connection timeout (default 8s) and 64 KiB combined output cap. A refusal or timeout is
   recorded as `reachable = false`; we do not retry aggressively.
+- **Public addresses only.** All DNS answers are checked and one address is pinned. Private, reserved and transition addresses are rejected.
 - **Opt-out first.** A host listed in `optout.txt`, or marked `opted_out_at` in the
   database, is skipped before any connection, and is honored within one run.
 
@@ -52,3 +53,15 @@ qProbe, quantakrypto's endpoint prober, is gated behind an ownership attestation
 because it is meant for endpoints you control. The observatory measures hosts we do
 not own, so it deliberately does not use qProbe; it is a separate, self-contained
 worker with this narrower, read-only policy and its own opt-out path.
+
+## Evidence boundary
+
+The first silent connection supplies the authenticated observation; export does
+not add another panel-wide probe. Only OpenSSL stderr diagnostics from a completed
+TLS 1.3 handshake with `-verify_return_error` are accepted as evidence. Offered
+groups, failed validation and partial handshakes never count as negotiated hybrid.
+Ticket material remains in a private temporary directory and is deleted after the
+probe; only public diagnostic metadata is eligible for export. Resumption remains
+unknown when no ticket was issued or the resumption attempt did not complete.
+Unsigned historical rows are not signed retrospectively. Optional signatures
+identify the authorized collector statement and do not prove collector honesty.

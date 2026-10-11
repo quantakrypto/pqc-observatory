@@ -1,7 +1,8 @@
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadPanel, loadOptOut, type SeedHost } from "./hosts.js";
-import { measureHost } from "./probe.js";
+import { measureHost, runOpenSsl } from "./probe.js";
+import { exporterFromEnvironment, collectRecord } from "./export.js";
 import { openDb, ensureSchema, upsertHosts, fetchHostRows, upsertProbe, computeRollup } from "./db.js";
 
 /**
@@ -52,7 +53,7 @@ const tri = (v: boolean | null): string => (v === null ? "n/a" : v ? "yes" : "no
 export function resolveDate(opts: Pick<RunOptions, "date" | "now">): string {
   const explicit = opts.date ?? process.env.OBS_DATE;
   if (explicit) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(explicit)) throw new Error(`invalid --date "${explicit}": expected YYYY-MM-DD`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(explicit) || !Number.isFinite(Date.parse(explicit)) || new Date(explicit).toISOString().slice(0, 10) !== explicit) throw new Error(`invalid --date "${explicit}": expected YYYY-MM-DD`);
     return explicit;
   }
   const d = opts.now ?? new Date();
@@ -81,6 +82,12 @@ export async function run(opts: RunOptions = {}): Promise<RunSummary> {
   const databaseUrl = opts.databaseUrl ?? process.env.DATABASE_URL;
   if (!dryRun && !databaseUrl) throw new Error("DATABASE_URL is not set (use --dry-run to probe without writing)");
 
+  // Initialize signing before any probes. Configured signing failures fail the run.
+  // Dry runs never invoke KMS or write evidence/ledger/database state.
+  const exporter = dryRun ? null : await exporterFromEnvironment();
+  const version = await runOpenSsl(["version"], timeoutMs);
+  if (version.exitCode !== 0 || version.error) throw new Error("OpenSSL is unavailable");
+  const opensslVersion = version.stdout.trim();
   const client = !dryRun && databaseUrl ? await openDb(databaseUrl) : null;
   let probed = 0;
   let reachable = 0;
@@ -105,7 +112,10 @@ export async function run(opts: RunOptions = {}): Promise<RunSummary> {
       if (!first && minIntervalMs > 0) await delay(minIntervalMs);
       first = false;
 
-      const m = await measureHost(seed.domain, { timeoutMs, sendRequest });
+      const m = await measureHost(seed.domain, { timeoutMs, sendRequest, opensslVersion });
+      if (!dryRun && process.env.OBS_COLLECT_OUTPUT && m.certificateValidated)
+        await collectRecord(process.env.OBS_COLLECT_OUTPUT, m);
+      const signed = exporter && m.certificateValidated ? await exporter.exportMeasurement(m) : null;
       probed += 1;
       if (m.reachable) {
         reachable += 1;
@@ -119,7 +129,7 @@ export async function run(opts: RunOptions = {}): Promise<RunSummary> {
             : `unreachable (${m.error ?? "unknown"})`
         }`,
       );
-      if (client) await upsertProbe(client, row?.id ?? seed.domain, runDate, m);
+      if (client) await upsertProbe(client, row?.id ?? seed.domain, runDate, m, signed?.token);
     }
 
     let pctHybridKex = reachable > 0 ? Math.round((hybrid / reachable) * 10000) / 100 : 0;
