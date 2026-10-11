@@ -8,11 +8,13 @@
  * without touching Postgres. DATABASE_URL is read from the environment.
  */
 import { run } from "./run.js";
+import { exportFreshRecords } from "./export.js";
 
 const HELP = `observatory - PQC readiness prober for the public panel
 
 Usage:
   observatory run [options]
+  observatory export --input-dir DIRECTORY
 
 Options:
   --date YYYY-MM-DD  Run date (default: OBS_DATE env, else today UTC)
@@ -29,6 +31,13 @@ Options:
 Environment:
   DATABASE_URL       Postgres connection string (required unless --dry-run)
   OBS_DATE           Fallback run date when --date is not given
+  OBS_COLLECT_OUTPUT  Private unsigned provenance directory for authenticated transfer
+  OBS_SIGNED_OUTPUT   Private signed evidence directory; enables authority integration
+  OBS_AUTHORITY_DIR   Deployed attestation-authority checkout (src/observation.mjs)
+  QK_ONLINE_KEY_REF / QK_ONLINE_KEY_ID   Existing KMS key reference and public key id
+  OBS_ISSUER / OBS_AUDIENCE / OBS_LEDGER_PATH   Explicit issuance policy
+  OBS_SIGNING_SUBJECTS  Required JSON array of independently authorized HTTPS subjects
+  OBS_SNAPSHOT_BINDINGS  Optional JSON map of subject to independently supplied manifest SHA-256
 `;
 
 type Parsed = { date?: string; panel?: string; optout?: string; timeout?: number; interval?: number; sendRequest?: boolean; dryRun?: boolean };
@@ -56,6 +65,12 @@ async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv.length === 0 || argv[0] === "-h" || argv[0] === "--help") {
     process.stdout.write(HELP);
+    return;
+  }
+  if (argv[0] === "export") {
+    if (argv.length !== 3 || argv[1] !== "--input-dir" || !argv[2]) throw new Error("usage: observatory export --input-dir DIRECTORY");
+    const count = await exportFreshRecords(argv[2]);
+    process.stdout.write(JSON.stringify({ signed: count })+"\n");
     return;
   }
   const { cmd, opts } = parseArgs(argv);

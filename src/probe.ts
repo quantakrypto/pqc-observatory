@@ -1,29 +1,22 @@
 import { spawn } from "node:child_process";
 import { lookup } from "node:dns/promises";
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isIP, BlockList } from "node:net";
 
-/**
- * A single host measurement, produced by two or three read-only TLS handshakes driven
- * by `openssl s_client`. The first is silent: it offers the hybrid group first alongside
- * classical fallbacks, records which the server actually selects along with the
- * certificate's signature algorithm and expiry, and writes nothing at all, so a ticket
- * arriving on it is one the server volunteered. Servers that volunteer nothing get a
- * second connection carrying one HEAD request, because roughly half of the panel withholds
- * NewSessionTicket until a request arrives and would otherwise look ticketless. The last
- * connection offers back whatever ticket was issued, to the SAME address and the SAME SNI,
- * and records whether the server resumed.
- *
- * Why the address is pinned: if the two connections landed on different edge nodes,
- * a failure to resume would be a statement about ticket-key distribution rather than
- * about the server's willingness to resume, and the two are indistinguishable after
- * the fact.
- *
- * Why `resumed` is nullable: a host that never issued a ticket cannot be said to have
- * refused to resume. That case records null, not false, so a coverage gap is never
- * counted as a refusal.
- */
+export const GROUPS = "X25519MLKEM768:X25519:secp256r1:secp384r1:x448";
+const HYBRID_GROUPS = new Set(["X25519MLKEM768", "SecP256r1MLKEM768", "SecP384r1MLKEM1024"]);
+const MAX_OUTPUT = 65536;
+
+export type Observation = {
+  profile: "openssl-tls13-v1";
+  observedAt: string;
+  endpoint: { host: string; port: number; address: string };
+  probe: { name: "openssl"; version: string; groups: string[]; certificateValidation: "pkix-hostname"; exitCode: number };
+  transcriptSha256: string;
+};
 export type Measurement = {
   reachable: boolean;
   kexHybrid: boolean;
@@ -32,332 +25,210 @@ export type Measurement = {
   cipher: string | null;
   certSigAlg: string | null;
   certNotAfter: string | null;
-  /** Address both connections used. Null when resolution failed. */
   address: string | null;
-  /**
-   * Whether a session ticket was issued at all. Null only when no request was sent and none
-   * arrived unprompted, in which case the server was never really asked.
-   */
   ticketIssued: boolean | null;
-  /** Server's lifetime hint in seconds, when it printed one. */
   ticketLifetimeS: number | null;
-  /**
-   * Whether the server volunteered a ticket on a connection that sent no application data.
-   * False means none arrived while the silent connection was held open, which is a bounded
-   * claim: the bound is SILENT_MS + HOLD_MS below, not infinity. Null when the silent
-   * connection never completed a handshake.
-   */
   ticketWithoutRequest: boolean | null;
-  /** True resumed, false refused, null not askable because no ticket was issued. */
   resumed: boolean | null;
   error: string | null;
+  /** Added fields are never inferred for old database rows. */
+  certificateValidated: boolean;
+  peerSignatureType: string | null;
+  observation: Observation | null;
+  /** Exact bounded OpenSSL stderr bytes decoded as UTF-8, not application stdout. */
+  transcript: string | null;
 };
 
-/** Hybrid first, then classical fallbacks, so a hybrid-capable server selects it and others still connect. */
-const GROUPS = "X25519MLKEM768:X25519:secp256r1:secp384r1:x448";
-
-/** Only the negotiated TLS 1.3 group counts as hybrid, not an offered group. */
 export function isNegotiatedHybrid(group: string | null, tlsVersion: string | null): boolean {
-  return tlsVersion === "TLSv1.3" && group === "X25519MLKEM768";
+  return tlsVersion === "TLSv1.3" && group !== null && HYBRID_GROUPS.has(group);
 }
-
-/**
- * Run openssl with args (no shell), feed `stdin`, capture stdout+stderr, hard timeout.
- *
- * `holdMs` keeps stdin open that long before closing it. A TLS 1.3 NewSessionTicket
- * arrives AFTER the handshake, so a client that writes nothing and exits immediately
- * never sees one, and every host would look as though it issued no ticket.
- */
-function runOpenssl(args: string[], timeoutMs: number, stdin: string, holdMs = 0): Promise<string> {
-  return new Promise((resolve) => {
-    const p = spawn("openssl", args, { stdio: ["pipe", "pipe", "pipe"] });
-    let out = "";
-    const timer = setTimeout(() => {
-      try {
-        p.kill("SIGKILL");
-      } catch {
-        /* already gone */
-      }
-    }, timeoutMs);
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.stderr.on("data", (d) => (out += d.toString()));
-    p.on("error", () => {
-      clearTimeout(timer);
-      resolve(out);
-    });
-    p.on("close", () => {
-      clearTimeout(timer);
-      resolve(out);
-    });
-    try {
-      p.stdin.write(stdin);
-      if (holdMs > 0) {
-        const hold = setTimeout(() => {
-          try {
-            p.stdin.end();
-          } catch {
-            /* already closed */
-          }
-        }, holdMs);
-        hold.unref?.();
-      } else {
-        p.stdin.end();
-      }
-    } catch {
-      /* ignore */
-    }
-  });
-}
-
-/**
- * One s_client connection that answers two questions instead of one.
- *
- * It completes the handshake, waits `silentMs`, sends `request`, then holds the connection open
- * `holdMs` longer so a post-handshake NewSessionTicket has time to arrive.
- *
- * Passing an empty `request` makes this a silent connection: it handshakes, waits, and closes
- * without ever writing application data. That is how `ticketWithoutRequest` is measured.
- *
- * It has to be a separate connection, and this is worth recording because the obvious cheaper
- * design does not work. Snapshotting the transcript just before writing the request, to see
- * whether a ticket had already arrived, reads empty for every host including the ones that
- * demonstrably volunteer one: s_client surfaces the ticket banner only as the connection
- * closes, by which point the request has long gone. Measured, against aws.amazon.com: 3,780
- * bytes of transcript had arrived after 2.5s of silence with no banner, and the banner
- * appeared at close. Not output buffering, just when s_client prints it.
- */
-function runSClient(
-  args: string[],
-  timeoutMs: number,
-  request: string,
-  silentMs: number,
-  holdMs: number,
-): Promise<string> {
-  return new Promise((resolve) => {
-    const p = spawn("openssl", args, { stdio: ["pipe", "pipe", "pipe"] });
-    let out = "";
-    let settled = false;
-    const done = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(out);
-    };
-    const timer = setTimeout(() => {
-      try {
-        p.kill("SIGKILL");
-      } catch {
-        /* already gone */
-      }
-    }, timeoutMs);
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.stderr.on("data", (d) => (out += d.toString()));
-    p.on("error", done);
-    p.on("close", done);
-
-    const send = setTimeout(() => {
-      try {
-        if (request) p.stdin.write(request);
-      } catch {
-        /* ignore */
-      }
-      const end = setTimeout(() => {
-        try {
-          p.stdin.end();
-        } catch {
-          /* already closed */
-        }
-      }, holdMs);
-      end.unref?.();
-    }, silentMs);
-    send.unref?.();
-  });
-}
-
-/**
- * Format a resolved address for `s_client -connect`.
- *
- * An IPv6 literal MUST be bracketed, because the host and the port are colon-separated and
- * without brackets OpenSSL cannot tell where the address ends: it rejects the argument with
- * "ambiguous host or service" and the probe records the host as unreachable.
- *
- * This is not hypothetical. Pinning the address (added with the resumption measurement) made the
- * prober format its own connect string for the first time, and on the run of 2026-08-28 every
- * host whose resolver answered with an AAAA record went dark at once: 99 addresses came back
- * IPv6, 95 hosts flipped from reachable to unreachable in a single day, and the panel's reachable
- * count fell from 249 to 160. Nothing about those hosts had changed.
- */
 export function connectTarget(address: string, port: number): string {
   return address.includes(":") ? `[${address}]:${port}` : `${address}:${port}`;
 }
 
-function firstPem(s: string): string | null {
-  const m = s.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/);
-  return m ? m[0] : null;
+type ProcessResult = { stdout: string; stderr: string; exitCode: number | null; error: string | null };
+/** Bounded independent streams. Application bytes cannot become TLS diagnostics. */
+export function runOpenSsl(
+  args: string[], timeoutMs: number, input = "", holdMs = 0, binary = process.env.OPENSSL_BINARY || "openssl",
+): Promise<ProcessResult> {
+  return new Promise((resolve) => {
+    const p = spawn(binary, args, { stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, LC_ALL: "C" } });
+    const stdout: Buffer[] = [], stderr: Buffer[] = [];
+    let bytes = 0, error: string | null = null, settled = false;
+    const timer = setTimeout(() => { error = "timeout"; p.kill("SIGKILL"); }, timeoutMs);
+    let end: NodeJS.Timeout | undefined;
+    const finish = (exitCode: number | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (end) clearTimeout(end);
+      try {
+        const decoder = new TextDecoder("utf-8", { fatal: true });
+        resolve({ stdout: decoder.decode(Buffer.concat(stdout)), stderr: decoder.decode(Buffer.concat(stderr)), exitCode, error });
+      } catch { resolve({ stdout: "", stderr: "", exitCode, error: "invalid UTF-8 diagnostics" }); }
+    };
+    const read = (target: Buffer[], data: Buffer): void => {
+      if (error) return;
+      bytes += data.length;
+      if (bytes > MAX_OUTPUT) { error = "output limit"; p.kill("SIGKILL"); return; }
+      target.push(data);
+    };
+    p.stdout.on("data", (d: Buffer) => read(stdout, d));
+    p.stderr.on("data", (d: Buffer) => read(stderr, d));
+    p.stdin.on("error", () => { /* EPIPE after a rejected handshake is reported by exitCode. */ });
+    p.on("error", (e) => { error = e.message.slice(0, 120); finish(null); });
+    p.on("close", finish);
+    if (input) p.stdin.write(input);
+    if (holdMs > 0) end = setTimeout(() => p.stdin.end(), holdMs);
+    else p.stdin.end();
+  });
 }
 
-function parseNotAfter(x509text: string): string | null {
-  const m = x509text.match(/notAfter=(.+)/);
-  if (!m || !m[1]) return null;
-  const d = new Date(m[1].trim());
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+function one(output: string, pattern: RegExp): string | null {
+  const matches = [...output.matchAll(pattern)];
+  return matches.length === 1 ? matches[0]?.[1]?.trim() ?? null : null;
+}
+export function parseDiagnostic(output: string): {
+  tlsVersion: string | null; cipher: string | null; group: string | null; signature: string | null; validated: boolean;
+} {
+  const tlsVersion = one(output, /^Protocol version:\s*(\S+)\s*$/gm);
+  const cipher = one(output, /^Ciphersuite:\s*(\S+)\s*$/gm);
+  const group = one(output, /^(?:Negotiated TLS1\.3 group|Peer Temp Key|Server Temp Key):\s*([^\r\n,]+)/gm);
+  const signature = one(output, /^Signature type:\s*([^\r\n]+)/gm);
+  const validated = tlsVersion === "TLSv1.3" && cipher !== null && cipher !== "(NONE)" && cipher !== "0000"
+    && [...output.matchAll(/^Verification: OK\s*$/gm)].length === 1
+    && !/verify error|verification error|alert |handshake failure/i.test(output)
+    && group !== null && signature !== null;
+  return { tlsVersion, cipher, group, signature, validated };
+}
+async function hasSession(path: string): Promise<boolean> {
+  try { const s = await stat(path); return s.isFile() && s.size > 0 && s.size <= MAX_OUTPUT; }
+  catch { return false; }
 }
 
-/** One read-only handshake per host. Never throws; failures come back as `reachable: false`. */
-export async function measureHost(
-  domain: string,
-  opts: { timeoutMs?: number; sendRequest?: boolean } = {},
-): Promise<Measurement> {
-  const timeoutMs = opts.timeoutMs ?? 8000;
-  // Default true. With it false the run sends no application data at all, which keeps the
-  // handshake-only promise but makes ticket issuance unobservable on servers that withhold
-  // NewSessionTicket until a request arrives; those record ticketIssued: null.
-  const sendRequest = opts.sendRequest ?? true;
+export interface ProbeOptions {
+  timeoutMs?: number;
+  sendRequest?: boolean;
+  /** Test/operator overrides, never derived from downloaded documents. */
+  address?: string;
+  allowPrivate?: boolean;
+  port?: number;
+  caFile?: string;
+  groups?: string;
+  holdMs?: number;
+  opensslVersion?: string;
+}
+
+/** Reuse the first silent handshake for authenticated evidence and ticket discovery. */
+export async function measureHost(domain: string, opts: ProbeOptions = {}): Promise<Measurement> {
+  const timeoutMs = opts.timeoutMs ?? 8000, port = opts.port ?? 443, groups = opts.groups ?? GROUPS;
+  if (!/^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(domain)
+      || domain.length > 253 || !Number.isInteger(port) || port < 1 || port > 65535
+      || !Number.isFinite(timeoutMs) || timeoutMs < 100 || timeoutMs > 30000
+      || !groups.split(":").every((g) => GROUPS.split(":").includes(g))) throw new Error("invalid probe parameters");
+  const holdMs = opts.holdMs ?? 3000;
+  if (!Number.isInteger(holdMs) || holdMs < 0 || holdMs >= timeoutMs) throw new Error("invalid hold time");
   const base: Measurement = {
-    reachable: false,
-    kexHybrid: false,
-    kexGroup: null,
-    tlsVersion: null,
-    cipher: null,
-    certSigAlg: null,
-    certNotAfter: null,
-    address: null,
-    ticketIssued: null,
-    ticketLifetimeS: null,
-    ticketWithoutRequest: null,
-    resumed: null,
-    error: null,
+    reachable: false, kexHybrid: false, kexGroup: null, tlsVersion: null, cipher: null,
+    certSigAlg: null, certNotAfter: null, address: null, ticketIssued: null,
+    ticketLifetimeS: null, ticketWithoutRequest: null, resumed: null, error: null,
+    certificateValidated: false, peerSignatureType: null, observation: null, transcript: null,
   };
-
-  // Resolve once and pin, so both connections reach the same node. Without this a
-  // non-resumption is unreadable: it could be the server refusing or simply a different
-  // edge node that never held the ticket key.
   let address: string;
   try {
-    address = (await lookup(domain)).address;
-  } catch (e) {
-    return { ...base, error: `dns: ${(e as Error).message}`.slice(0, 120) };
-  }
-
+    if (opts.address) address = opts.address;
+    else {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        address = await Promise.race([lookup(domain, { all: true }).then((results) => {
+            if (!results.length || (!opts.allowPrivate && results.some((r) => !isPublicAddress(r.address))))
+              throw new Error("non-public DNS answer rejected");
+            return results[0]!.address;
+          }),
+          new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("DNS timeout")), timeoutMs); })]);
+      } finally { if (timer) clearTimeout(timer); }
+    }
+    if (!isIP(address) || (!opts.allowPrivate && !isPublicAddress(address))) throw new Error("non-public pinned address rejected");
+  } catch (e) { return { ...base, error: `dns: ${(e as Error).message}`.slice(0, 120) }; }
+  base.address = address;
+  const version = opts.opensslVersion ?? (await runOpenSsl(["version"], timeoutMs)).stdout.trim();
+  if (!version.startsWith("OpenSSL ") || version.length > 256) return { ...base, error: "cannot identify OpenSSL" };
   const work = await mkdtemp(join(tmpdir(), "obs-"));
   const sessionFile = join(work, "session.pem");
   try {
-    return await measurePinned(domain, address, sessionFile, timeoutMs, sendRequest, base);
-  } finally {
-    await rm(work, { recursive: true, force: true });
-  }
+    const connect = ["s_client", "-connect", connectTarget(address, port), "-servername", domain,
+      "-verify_hostname", domain, "-verify_return_error", "-tls1_3", "-groups", groups];
+    if (opts.caFile) connect.push("-CAfile", opts.caFile);
+    const first = await runOpenSsl([...connect, "-brief", "-sess_out", sessionFile], timeoutMs, "", holdMs);
+    const parsed = parseDiagnostic(first.stderr);
+    if (first.exitCode !== 0 || first.error || !parsed.validated || !groups.split(":").includes(parsed.group ?? "")) {
+      return { ...base, error: first.error ?? `TLS validation failed (exit ${first.exitCode})` };
+    }
+    const observedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+    const observation: Observation = { profile: "openssl-tls13-v1", observedAt,
+      endpoint: { host: domain, port, address },
+      probe: { name: "openssl", version, groups: groups.split(":"), certificateValidation: "pkix-hostname", exitCode: 0 },
+      transcriptSha256: createHash("sha256").update(first.stderr, "utf8").digest("hex") };
+    const volunteered = await hasSession(sessionFile);
+    const request = opts.sendRequest === false ? "" : `HEAD / HTTP/1.1\r\nHost: ${domain}\r\nConnection: close\r\n\r\n`;
+    let askedSucceeded = false;
+    if (!volunteered && request) {
+      const asked = await runOpenSsl([...connect, "-brief", "-sess_out", sessionFile], timeoutMs, request, holdMs);
+      askedSucceeded = asked.exitCode === 0 && !asked.error && parseDiagnostic(asked.stderr).validated;
+      if (!askedSucceeded) await rm(sessionFile, { force: true });
+    }
+    const issued = await hasSession(sessionFile);
+    let certSigAlg: string | null = null, certNotAfter: string | null = null, lifetime: number | null = null;
+    if (issued) {
+      // A local session file is the only source; raw tickets are never exported.
+      const session = await runOpenSsl(["sess_id", "-in", sessionFile, "-text", "-noout"], timeoutMs);
+      if (session.exitCode === 0 && !session.error) {
+        const life = one(session.stdout, /^\s*TLS session ticket lifetime hint:\s*(\d+)/gm);
+        lifetime = life === null ? null : Number(life);
+      }
+      const cert = await runOpenSsl(["sess_id", "-in", sessionFile, "-cert"], timeoutMs);
+      if (cert.exitCode === 0 && !cert.error && cert.stdout.includes("-----BEGIN CERTIFICATE-----")) {
+        const details = await runOpenSsl(["x509", "-noout", "-text", "-enddate"], timeoutMs, cert.stdout);
+        if (details.exitCode === 0 && !details.error) {
+          certSigAlg = details.stdout.match(/Signature Algorithm:\s*([^\r\n]+)/)?.[1]?.trim() ?? null;
+          const expiry = details.stdout.match(/^notAfter=(.+)$/m)?.[1];
+          if (expiry && Number.isFinite(Date.parse(expiry))) certNotAfter = new Date(expiry).toISOString();
+        }
+      }
+    }
+    let resumed: boolean | null = null;
+    if (issued) {
+      const again = await runOpenSsl([...connect, "-sess_in", sessionFile], timeoutMs, request);
+      // Exactly one genuine OpenSSL completion banner is required. Injecting an
+      // additional banner in application output creates ambiguity, never success.
+      const reuse = one(again.stdout, /^(New|Reused), TLSv1\.3, Cipher is \S+\s*$/gm);
+      if (again.exitCode === 0 && !again.error && reuse) resumed = reuse === "Reused";
+    }
+    return { ...base, reachable: true, kexHybrid: isNegotiatedHybrid(parsed.group, parsed.tlsVersion),
+      kexGroup: parsed.group, tlsVersion: parsed.tlsVersion, cipher: parsed.cipher, certSigAlg, certNotAfter,
+      ticketIssued: issued ? true : askedSucceeded ? false : null, ticketLifetimeS: lifetime,
+      ticketWithoutRequest: volunteered, resumed, certificateValidated: true,
+      peerSignatureType: parsed.signature, observation, transcript: first.stderr };
+  } finally { await rm(work, { recursive: true, force: true }); }
 }
 
-/** Both handshakes, against a pinned address. Never throws. */
-async function measurePinned(
-  domain: string,
-  address: string,
-  sessionFile: string,
-  timeoutMs: number,
-  sendRequest: boolean,
-  base: Measurement,
-): Promise<Measurement> {
-  base = { ...base, address };
-  // HOLD_MS keeps the connection open after the handshake so a TLS 1.3
-  // NewSessionTicket, which arrives post-handshake, has time to be written out.
-  // Sending nothing and exiting immediately would miss every TLS 1.3 ticket.
-  const SILENT_MS = 1500;
-  const HOLD_MS = 1500;
-  // A HEAD for the root, nothing else. It reads no body and changes no state, and it is what
-  // a browser sends on every visit. It exists only to make ticket issuance observable on the
-  // servers that withhold NewSessionTicket until a request arrives.
-  const request = sendRequest ? `HEAD / HTTP/1.1\r\nHost: ${domain}\r\nConnection: close\r\n\r\n` : "";
-  const connect = ["s_client", "-connect", connectTarget(address, 443), "-servername", domain,
-                   "-verify_hostname", domain, "-groups", GROUPS];
-
-  // First connection, silent. Nothing is written on it, so a ticket arriving here is one the
-  // server offered without being asked for anything.
-  const out = await runSClient(
-    [...connect, "-sess_out", sessionFile],
-    timeoutMs,
-    "",
-    SILENT_MS,
-    HOLD_MS,
-  );
-
-  const reachable = /Protocol\s*:\s*TLS|New,\s*TLS/i.test(out);
-  if (!reachable) {
-    const alert =
-      out.match(/tlsv[\d]*\s*alert[^\n]*/i) ||
-      out.match(/(connect:errno=\d+|Connection refused|Name or service not known|no peer certificate|timeout)/i);
-    return { ...base, error: alert ? alert[0].trim().slice(0, 120) : "no TLS negotiated" };
+/** Fail closed for private, reserved, translation and transition destinations. */
+export function isPublicAddress(address: string): boolean {
+  const family = isIP(address);
+  if (!family) return false;
+  const blocked = new BlockList();
+  if (family === 4) {
+    for (const [network, prefix] of [["0.0.0.0",8],["10.0.0.0",8],["100.64.0.0",10],["127.0.0.0",8],
+      ["169.254.0.0",16],["172.16.0.0",12],["192.0.0.0",24],["192.0.2.0",24],["192.88.99.0",24],
+      ["192.168.0.0",16],["198.18.0.0",15],["198.51.100.0",24],["203.0.113.0",24],["224.0.0.0",4],["240.0.0.0",4]] as const)
+      blocked.addSubnet(network, prefix, "ipv4");
+    return !blocked.check(address, "ipv4");
   }
-
-  const groupM = out.match(/Negotiated TLS1\.3 group:\s*(\S+)/i) || out.match(/Server Temp Key:\s*([^\n,]+)/i);
-  const verM = out.match(/Protocol\s*:\s*(\S+)/i) || out.match(/New,\s*(TLSv[\d.]+)/i);
-  const cipherM = out.match(/Cipher\s*:\s*(\S+)/i) || out.match(/Cipher is\s*(\S+)/i);
-
-  let certSigAlg: string | null = null;
-  let certNotAfter: string | null = null;
-  const pem = firstPem(out);
-  if (pem) {
-    const x = await runOpenssl(["x509", "-noout", "-enddate", "-text"], timeoutMs, pem);
-    certNotAfter = parseNotAfter(x);
-    const sigM = x.match(/Signature Algorithm:\s*([^\n]+)/i);
-    certSigAlg = sigM?.[1]?.trim() ?? null;
-  }
-
-  // A ticket shows up either as the TLS 1.3 post-handshake banner or, on 1.2, as a
-  // session block carrying ticket material.
-  const TICKET = /Post-Handshake New Session Ticket arrived|TLS session ticket:/i;
-  const LIFETIME = /TLS session ticket lifetime hint:\s*(\d+)/i;
-
-  const volunteered = TICKET.test(out);
-  let ticketTranscript = out;
-
-  // Only the servers that volunteered nothing are asked. On this panel that is roughly half
-  // of them, so the request costs a connection where it buys an answer and nowhere else.
-  if (!volunteered && sendRequest) {
-    const asked = await runSClient(
-      [...connect, "-sess_out", sessionFile],
-      timeoutMs,
-      request,
-      0,
-      HOLD_MS,
-    );
-    if (TICKET.test(asked)) ticketTranscript = asked;
-  }
-
-  const sawTicket = TICKET.test(ticketTranscript);
-  // With a request sent, absence is a real absence. Without one, it is merely unobserved.
-  const ticketIssued: boolean | null = sawTicket ? true : sendRequest ? false : null;
-  const lifeM = ticketTranscript.match(LIFETIME);
-
-  let resumed: boolean | null = null;
-  if (sawTicket) {
-    // Same address, same SNI, ticket offered back. Never to a different host: replaying
-    // across hosts is a scope experiment on somebody else's access control, not ours to run.
-    const again = await runOpenssl(
-      [...connect, "-sess_in", sessionFile],
-      timeoutMs,
-      request,
-      0,
-    );
-    if (/Protocol\s*:\s*TLS|New,\s*TLS|Reused,\s*TLS/i.test(again)) {
-      resumed = /Reused,\s*TLS/i.test(again);
-    }
-    // If the second connection produced no handshake at all, resumed stays null: we asked
-    // and got no answer, which is not the same as a refusal.
-  }
-
-  return {
-    reachable: true,
-    kexHybrid: isNegotiatedHybrid(groupM?.[1]?.trim() ?? null, verM?.[1] ?? null),
-    kexGroup: groupM?.[1]?.trim() ?? null,
-    tlsVersion: verM?.[1] ?? null,
-    cipher: cipherM?.[1] ?? null,
-    certSigAlg,
-    certNotAfter,
-    address,
-    ticketIssued,
-    ticketLifetimeS: lifeM ? Number(lifeM[1]) : null,
-    ticketWithoutRequest: volunteered,
-    resumed,
-    error: null,
-  };
+  const global = new BlockList();
+  global.addSubnet("2000::", 3, "ipv6");
+  blocked.addSubnet("2001::", 23, "ipv6");
+  blocked.addSubnet("2001:db8::", 32, "ipv6");
+  blocked.addSubnet("2002::", 16, "ipv6");
+  blocked.addSubnet("3fff::", 20, "ipv6");
+  return global.check(address, "ipv6") && !blocked.check(address, "ipv6");
 }

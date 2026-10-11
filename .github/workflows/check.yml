@@ -2,18 +2,52 @@ name: Observatory checks
 on:
   pull_request:
   push:
-    branches: [main, fix/negotiated-hybrid-classification]
+    branches: [main, fix/negotiated-hybrid-classification, implementation/authenticated-evidence]
+permissions:
+  contents: read
 jobs:
   check:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          node-version: '22'
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
           cache: npm
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+      - name: Record exact tested commit
+        run: |
+          mkdir -p build/results
+          git rev-parse HEAD | tee build/results/commit.txt
+          test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha || github.sha }}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: quantakrypto/crypto-agility
+          ref: e969b12423c2baa93efe8ff1f0f4a7623243628a
+          path: .ci/crypto-agility
+          persist-credentials: false
+      - name: Build immutable hybrid TLS test runtime
+        run: bash .ci/crypto-agility/scripts/build-test-openssl.sh "$RUNNER_TEMP/openssl" > build/results/openssl-build.log 2>&1
+      - run: npm ci --ignore-scripts
+      - name: Typecheck
+        run: |
+          set -o pipefail
+          npm run typecheck 2>&1 | tee build/results/typecheck.log
+      - name: Real local TLS and security tests (hybrid required; no skips)
+        env:
+          OPENSSL_BINARY: ${{ runner.temp }}/openssl/apps/openssl
+          REQUIRE_HYBRID_TLS: '1'
+        run: |
+          set -o pipefail
+          node --import tsx --test --test-reporter=tap tests/*.test.ts 2>&1 | tee build/results/tests.tap
+          node -e 'const s=require("fs").readFileSync("build/results/tests.tap","utf8");if(!/^# skipped 0$/m.test(s)||!/^# fail 0$/m.test(s)||!/^# tests [1-9][0-9]*$/m.test(s))process.exit(1)'
+      - name: Retain exact-commit validation evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: observatory-validation-${{ github.event.pull_request.head.sha || github.sha }}
+          path: build/results/
+          retention-days: 30
