@@ -56,6 +56,11 @@ export type Measurement = {
 /** Hybrid first, then classical fallbacks, so a hybrid-capable server selects it and others still connect. */
 const GROUPS = "X25519MLKEM768:X25519:secp256r1:secp384r1:x448";
 
+/** Only the negotiated TLS 1.3 group counts as hybrid, not an offered group. */
+export function isNegotiatedHybrid(group: string | null, tlsVersion: string | null): boolean {
+  return tlsVersion === "TLSv1.3" && group === "X25519MLKEM768";
+}
+
 /**
  * Run openssl with args (no shell), feed `stdin`, capture stdout+stderr, hard timeout.
  *
@@ -342,7 +347,7 @@ async function measurePinned(
 
   return {
     reachable: true,
-    kexHybrid: /X25519MLKEM768/i.test(out),
+    kexHybrid: isNegotiatedHybrid(groupM?.[1]?.trim() ?? null, verM?.[1] ?? null),
     kexGroup: groupM?.[1]?.trim() ?? null,
     tlsVersion: verM?.[1] ?? null,
     cipher: cipherM?.[1] ?? null,
